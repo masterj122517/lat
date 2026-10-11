@@ -1,0 +1,20 @@
+[package]
+name = "lat"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A zero-setup terminal dashboard for local coding agents and their tmux panes"
+license = "MIT"
+repository = "https://github.com/masterj122517/lat"
+readme = "README.md"
+
+[dependencies]
+ratatui = { version = "=0.29.0", default-features = false, features = ["crossterm"] }
+crossterm = "=0.28.1"
+sysinfo = { version = "=0.37.2", default-features = false, features = ["system"] }
+parking_lot = "=0.12.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
