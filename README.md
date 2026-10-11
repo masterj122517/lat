@@ -1,5 +1,7 @@
 <div align="center">
 
+<p><img src="assets/logo.png" alt="lat's lazy penguin logo" width="180"></p>
+
 # lat
 
 **Your agents. One view. The exact pane.**
