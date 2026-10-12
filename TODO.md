@@ -1,0 +1,1 @@
+- [ ] Jump to the agent outside the tmux
