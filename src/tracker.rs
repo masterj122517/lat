@@ -1,5 +1,8 @@
 use crate::{
+    attention,
     discovery::{AgentKey, Discovery},
+    notification::Notifier,
+    terminal,
     tmux::{self, Client, Pane, Tmux},
 };
 use parking_lot::{Condvar, Mutex};
@@ -47,6 +50,7 @@ pub(crate) struct Row {
     pub state: String,
     pub pane: Option<Pane>,
     pub activity: Activity,
+    pub attention: Option<&'static str>,
 }
 impl Row {
     pub(crate) fn location(&self) -> String {
@@ -83,12 +87,13 @@ pub(crate) enum Preview {
 pub(crate) struct Snapshot {
     pub rows: Vec<Row>,
     pub error: Option<String>,
+    pub notification_error: Option<String>,
     pub preview: Option<(AgentKey, Preview)>,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct Navigation {
     pub key: AgentKey,
-    pub pane: Pane,
+    pub pane: Option<Pane>,
     pub client: Option<String>,
 }
 #[derive(Clone, Debug)]
@@ -98,6 +103,7 @@ pub(crate) enum NavResult {
         client: Option<String>,
     },
     Choose(Vec<Client>),
+    Focused,
     Error(String),
 }
 #[derive(Default)]
@@ -161,9 +167,31 @@ impl Drop for Tracker {
 }
 #[derive(PartialEq, Eq)]
 struct CaptureKey {
+    pane_pid: u32,
     timestamp: Option<u64>,
     width: u32,
     height: u32,
+}
+
+/// One alert per observed waiting episode; read failures do not rearm it.
+#[derive(Default)]
+struct AttentionState {
+    pane: Option<(String, u32)>,
+    waiting: bool,
+}
+impl AttentionState {
+    fn observe(&mut self, pane: &Pane, waiting: bool) -> bool {
+        let same_pane = self
+            .pane
+            .as_ref()
+            .is_some_and(|(id, pid)| id == &pane.pane_id && *pid == pane.pane_pid);
+        let alert = waiting && (!same_pane || !self.waiting);
+        if !same_pane {
+            self.pane = Some((pane.pane_id.clone(), pane.pane_pid));
+        }
+        self.waiting = waiting;
+        alert
+    }
 }
 fn collect(shared: Arc<(Mutex<Exchange>, Condvar)>) {
     let mut discovery = Discovery::new();
@@ -173,6 +201,9 @@ fn collect(shared: Arc<(Mutex<Exchange>, Condvar)>) {
     let origin_pane = std::env::var("TMUX_PANE").ok();
     let mut snapshot = Snapshot::default();
     let mut cache: HashMap<String, (CaptureKey, Preview)> = HashMap::new();
+    let mut screens: HashMap<String, (CaptureKey, Preview)> = HashMap::new();
+    let mut attention_states: HashMap<AgentKey, AttentionState> = HashMap::new();
+    let mut notifier = Notifier::new();
     let mut next_scan = Instant::now();
     loop {
         let (scan, refresh, selected, navigation) = {
@@ -222,6 +253,7 @@ fn collect(shared: Arc<(Mutex<Exchange>, Condvar)>) {
                     state: a.state,
                     pane,
                     activity,
+                    attention: None,
                 }
             }));
             snapshot
@@ -229,6 +261,60 @@ fn collect(shared: Arc<(Mutex<Exchange>, Condvar)>) {
                 .sort_by_cached_key(|r| (r.key.product, r.project(), r.location(), r.key.root_pid));
             snapshot.error = error;
             cache.retain(|id, _| panes.iter().any(|p| &p.pane_id == id && !p.dead));
+            screens.retain(|id, _| panes.iter().any(|p| &p.pane_id == id && !p.dead));
+            attention_states.retain(|key, _| snapshot.rows.iter().any(|r| &r.key == key));
+            let mut alerted_panes = std::collections::HashSet::new();
+            for row in &mut snapshot.rows {
+                let Some(pane) = &row.pane else {
+                    if snapshot.error.is_none() {
+                        attention_states.remove(&row.key);
+                    }
+                    continue;
+                };
+                let capture_key = CaptureKey {
+                    pane_pid: pane.pane_pid,
+                    timestamp: pane.last_output,
+                    width: pane.width,
+                    height: pane.height,
+                };
+                if refresh
+                    || pane.last_output.is_none()
+                    || screens.get(&pane.pane_id).is_none_or(|(old, preview)| {
+                        *old != capture_key || matches!(preview, Preview::Error(_))
+                    })
+                {
+                    let screen = match tmux.screen(pane) {
+                        Ok(text) => Preview::Text(Arc::new(text)),
+                        Err(error) => Preview::Error(error.to_string()),
+                    };
+                    screens.insert(pane.pane_id.clone(), (capture_key, screen));
+                }
+                match &screens[&pane.pane_id].1 {
+                    Preview::Text(screen) => {
+                        row.attention = attention::detect(row.key.product, screen);
+                        let alert = attention_states
+                            .entry(row.key)
+                            .or_default()
+                            .observe(pane, row.attention.is_some());
+                        if alert && alerted_panes.insert(&pane.pane_id) {
+                            let title = format!("lat: {} needs input", row.key.product);
+                            let body = format!(
+                                "{} · {}\n{} (pane-level detection)",
+                                row.project(),
+                                row.location(),
+                                row.attention.unwrap()
+                            );
+                            snapshot.notification_error = notifier.send(&title, &body).err();
+                        }
+                    }
+                    Preview::Error(error) => {
+                        snapshot.error.get_or_insert_with(|| {
+                            format!("Could not inspect agent input prompts: {error}")
+                        });
+                    }
+                    Preview::NoPane => unreachable!(),
+                }
+            }
             next_scan = Instant::now() + Duration::from_secs(1);
         }
         snapshot.preview = selected.map(|key| {
@@ -241,6 +327,7 @@ fn collect(shared: Arc<(Mutex<Exchange>, Condvar)>) {
                 None => Preview::NoPane,
                 Some(pane) => {
                     let capture_key = CaptureKey {
+                        pane_pid: pane.pane_pid,
                         timestamp: pane.last_output,
                         width: pane.width,
                         height: pane.height,
@@ -282,9 +369,13 @@ fn collect(shared: Arc<(Mutex<Exchange>, Condvar)>) {
 fn valid_target(snapshot: &Snapshot, request: &Navigation) -> bool {
     snapshot.rows.iter().any(|row| {
         row.key == request.key
-            && row.pane.as_ref().is_some_and(|p| {
-                p.pane_pid == request.pane.pane_pid && p.target() == request.pane.target()
-            })
+            && match (row.pane.as_ref(), request.pane.as_ref()) {
+                (Some(pane), Some(expected)) => {
+                    pane.pane_pid == expected.pane_pid && pane.target() == expected.target()
+                }
+                (None, None) => true,
+                _ => false,
+            }
     })
 }
 fn validate_navigation(
@@ -298,9 +389,15 @@ fn validate_navigation(
     if !valid_target(snapshot, request) {
         return NavResult::Error("Agent or tmux pane is no longer available".into());
     }
+    let Some(target_pane) = &request.pane else {
+        return match terminal::focus(request.key) {
+            Ok(()) => NavResult::Focused,
+            Err(error) => NavResult::Error(error),
+        };
+    };
     if !inside {
         return NavResult::Ready {
-            target: request.pane.target(),
+            target: target_pane.target(),
             client: None,
         };
     }
@@ -317,7 +414,7 @@ fn validate_navigation(
     if let Some(chosen) = &request.client {
         return if clients.iter().any(|c| &c.name == chosen) {
             NavResult::Ready {
-                target: request.pane.target(),
+                target: target_pane.target(),
                 client: Some(chosen.clone()),
             }
         } else {
@@ -327,7 +424,7 @@ fn validate_navigation(
     match clients.as_slice() {
         [] => NavResult::Error("No attached client is viewing the tracker pane".into()),
         [client] => NavResult::Ready {
-            target: request.pane.target(),
+            target: target_pane.target(),
             client: Some(client.name.clone()),
         },
         _ => NavResult::Choose(clients),
@@ -336,6 +433,42 @@ fn validate_navigation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn pane() -> Pane {
+        Pane {
+            session_id: "$1".into(),
+            window_id: "@2".into(),
+            pane_id: "%3".into(),
+            pane_pid: 41,
+            window_index: 0,
+            pane_index: 0,
+            height: 24,
+            width: 80,
+            dead: false,
+            last_output: Some(5),
+            session_name: "s".into(),
+            window_name: "w".into(),
+            path: "/work".into(),
+        }
+    }
+
+    #[test]
+    fn alerts_once_per_wait_and_rearms_after_input_or_pane_replacement() {
+        let mut state = AttentionState::default();
+        let mut pane = pane();
+        assert!(!state.observe(&pane, false));
+        assert!(state.observe(&pane, true));
+        pane.last_output = Some(100);
+        pane.width = 120;
+        assert!(!state.observe(&pane, true));
+        assert!(!state.observe(&pane, false));
+        assert!(state.observe(&pane, true));
+        pane.pane_pid += 1;
+        assert!(state.observe(&pane, true));
+        assert!(!state.observe(&pane, true));
+        pane.pane_id = "%99".into();
+        assert!(state.observe(&pane, true));
+    }
+
     #[test]
     fn pane_activity_requires_evidence() {
         assert_eq!(activity(Some(98), 100), Activity::OutputActive);
@@ -351,24 +484,10 @@ mod tests {
             root_pid: 42,
             start_time: 10,
         };
-        let pane = Pane {
-            session_id: "$1".into(),
-            window_id: "@2".into(),
-            pane_id: "%3".into(),
-            pane_pid: 41,
-            window_index: 0,
-            pane_index: 0,
-            height: 24,
-            width: 80,
-            dead: false,
-            last_output: Some(5),
-            session_name: "s".into(),
-            window_name: "w".into(),
-            path: "/work".into(),
-        };
-        let request = Navigation {
+        let pane = pane();
+        let mut request = Navigation {
             key,
-            pane: pane.clone(),
+            pane: Some(pane.clone()),
             client: None,
         };
         let mut snapshot = Snapshot {
@@ -378,6 +497,7 @@ mod tests {
                 state: "Run".into(),
                 pane: Some(pane),
                 activity: Activity::Quiet,
+                attention: None,
             }],
             ..Snapshot::default()
         };
@@ -389,6 +509,15 @@ mod tests {
         assert!(!valid_target(&snapshot, &request));
         snapshot.rows[0].pane.as_mut().unwrap().pane_pid = 41;
         snapshot.rows[0].pane.as_mut().unwrap().pane_id = "%4".into();
+        assert!(!valid_target(&snapshot, &request));
+        let original_pane = snapshot.rows[0].pane.take();
+        assert!(!valid_target(&snapshot, &request));
+        request.pane = None;
+        assert!(valid_target(&snapshot, &request));
+        snapshot.rows[0].key.start_time += 1;
+        assert!(!valid_target(&snapshot, &request));
+        snapshot.rows[0].key = key;
+        snapshot.rows[0].pane = original_pane;
         assert!(!valid_target(&snapshot, &request));
         snapshot.rows.clear();
         assert!(!valid_target(&snapshot, &request));

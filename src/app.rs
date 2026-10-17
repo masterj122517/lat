@@ -254,20 +254,16 @@ impl App {
             KeyCode::Enter => {
                 if self.navigation.is_none() {
                     if let Some(row) = self.row() {
-                        if let Some(pane) = &row.pane {
-                            let request = Navigation {
-                                key: row.key,
-                                pane: pane.clone(),
-                                client: None,
-                            };
-                            tracker.navigate(request.clone());
-                            self.navigation = Some(request);
-                            self.error = Some("Validating live agent and pane…".into());
-                        } else {
-                            self.error = Some("No tmux pane available".into());
-                        }
+                        let request = Navigation {
+                            key: row.key,
+                            pane: row.pane.clone(),
+                            client: None,
+                        };
+                        tracker.navigate(request.clone());
+                        self.navigation = Some(request);
+                        self.error = Some("Validating live agent and terminal…".into());
                     } else {
-                        self.error = Some("No tmux pane available".into());
+                        self.error = Some("No agent selected".into());
                     }
                 }
             }
@@ -372,7 +368,14 @@ impl App {
                     ListItem::new(vec![
                         Line::from(vec![
                             Span::raw(format!("{} #{}  ", row.key.product, row.key.root_pid)),
-                            Span::styled(row.activity.label(), Style::default().fg(color)),
+                            Span::styled(
+                                row.attention.unwrap_or_else(|| row.activity.label()),
+                                Style::default().fg(if row.attention.is_some() {
+                                    Color::Magenta
+                                } else {
+                                    color
+                                }),
+                            ),
                         ]),
                         Line::raw(
                             sanitize(&format!("{} · {}", row.project(), row.location()))
@@ -401,7 +404,9 @@ impl App {
                 .as_ref()
                 .map(|p| sanitize(&p.display().to_string()).replace('\n', "�"))
                 .unwrap_or_else(|| "unavailable".into());
-            let explanation = if row.pane.as_ref().is_some_and(|p| p.last_output.is_some()) {
+            let explanation = if let Some(reason) = row.attention {
+                reason
+            } else if row.pane.as_ref().is_some_and(|p| p.last_output.is_some()) {
                 "Shared-pane output; not agent intent"
             } else {
                 "Output activity unavailable; process is alive"
@@ -451,7 +456,11 @@ impl App {
         let footer = if self.editing.is_some() {
             format!("/{}  Enter accept · Esc cancel", self.filter)
         } else {
-            let error = self.error.as_deref().or(self.snapshot.error.as_deref());
+            let error = self
+                .error
+                .as_deref()
+                .or(self.snapshot.error.as_deref())
+                .or(self.snapshot.notification_error.as_deref());
             match error {
                 Some(error) => format!("q quit · ? help | {}", sanitize(error).replace('\n', " ")),
                 None => format!(
@@ -547,6 +556,10 @@ pub(crate) fn run() -> io::Result<()> {
                     app.error = Some(error);
                     app.navigation = None;
                 }
+                NavResult::Focused => {
+                    guard.restore()?;
+                    return Ok(());
+                }
                 NavResult::Choose(clients) => {
                     app.chooser = Some((clients, 0));
                     app.error = None;
@@ -628,6 +641,7 @@ mod tests {
             state: "Run".into(),
             pane: None,
             activity: Activity::Running,
+            attention: None,
         }
     }
     #[test]

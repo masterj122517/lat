@@ -75,13 +75,22 @@ impl Tmux {
         } else {
             format!("-{}", MAX_CAPTURE_LINES as u32 - pane.height)
         };
+        self.capture_from(pane, &start)
+    }
+
+    /// Captures only the current screen, never historical prompts in scrollback.
+    pub(crate) fn screen(&self, pane: &Pane) -> Result<String, TmuxError> {
+        self.capture_from(pane, "0")
+    }
+
+    fn capture_from(&self, pane: &Pane, start: &str) -> Result<String, TmuxError> {
         let output = self.run_control([
             "capture-pane",
             "-p",
             "-C",
             "-T",
             "-S",
-            &start,
+            start,
             "-E",
             "-",
             "-t",
